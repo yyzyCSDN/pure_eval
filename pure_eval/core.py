@@ -16,7 +16,43 @@ from pure_eval.utils import (
     is_any,
     of_type,
     ensure_dict,
+    MISSING_NAME,
+    UNSUPPORTED_SYNTAX,
+    UNSAFE_OPERATION,
+    OPERATION_ERROR,
 )
+
+
+class _Failure(Exception):
+    """
+    Internal signal that an expression could not be evaluated.
+    It carries the reason (one of the four reason constants), the AST node
+    which actually blocked evaluation and the path of AST field names and
+    list indices from the currently handled node down to that node.
+    """
+
+    def __init__(self, reason: str, node: ast.AST, *path: Any):
+        self.reason = reason
+        self.node = node
+        self.path = tuple(path)
+        super().__init__(reason)
+
+
+class _CachedFailure:
+    """
+    A failed evaluation stored in the cache: the reason, the blocking node
+    and the intrinsic path from the cache key node to that blocking node.
+    """
+
+    __slots__ = ("reason", "node", "path")
+
+    def __init__(self, reason: str, node: ast.AST, path: Tuple[Any, ...]):
+        self.reason = reason
+        self.node = node
+        self.path = path
+
+
+_unknown = object()
 
 
 class Evaluator:
@@ -58,25 +94,107 @@ class Evaluator:
         if not isinstance(node, ast.expr):
             raise TypeError("node should be an ast.expr, not {!r}".format(type(node).__name__))
 
-        with suppress(KeyError):
-            result = self._cache[node]
-            if result is CannotEval:
-                raise CannotEval
-            else:
-                return result
+        try:
+            return self._eval(node)
+        except _Failure:
+            raise CannotEval
+
+    def explain(self, node: ast.expr) -> Dict[str, Any]:
+        """
+        Explain whether the given node can be evaluated, like `__getitem__`,
+        but returning a diagnostic dictionary instead of raising `CannotEval`:
+
+            {"ok": bool, "value": Any, "reason": str, "node": ast.expr, "path": tuple}
+
+        On success `ok` is True, `value` is the value of the node and
+        `reason`, `node` and `path` are None.
+
+        On failure `ok` is False, `value` is None, `node` is the AST node
+        which actually blocked evaluation and `path` is a tuple of AST field
+        names and list indices from this node (the request root) to that
+        blocking node, e.g. ('values', 1) for the second value of a boolean
+        operation, or () when the root node itself blocks evaluation.
+
+        `reason` is one of:
+            - missing_name: an ast.Name was not found in the names mapping.
+            - unsupported_syntax: an AST node type or syntax form which this
+              evaluator does not handle, e.g. comprehensions or calls with
+              keyword or star arguments.
+            - unsafe_operation: supported syntax but a value, call target or
+              attribute access would cross the standard-types/static-access
+              safety boundary.
+            - operation_error: the operands passed the safety checks but a
+              built-in operation raised (e.g. division by zero, out of range
+              index, missing key), or a static attribute does not exist.
+
+        The result is cached either way. Hitting a cached failure never
+        re-evaluates the expression; the path is still rebuilt from this
+        request root following the original evaluation order.
+
+        :param node: an AST expression to evaluate
+        :return: a dictionary describing the evaluation result
+        """
+
+        if not isinstance(node, ast.expr):
+            raise TypeError("node should be an ast.expr, not {!r}".format(type(node).__name__))
 
         try:
-            self._cache[node] = result = self._handle(node)
-            return result
-        except CannotEval:
-            self._cache[node] = CannotEval
+            value = self._eval(node)
+        except _Failure as failure:
+            return {
+                "ok": False,
+                "value": None,
+                "reason": failure.reason,
+                "node": failure.node,
+                "path": failure.path,
+            }
+        return {
+            "ok": True,
+            "value": value,
+            "reason": None,
+            "node": None,
+            "path": None,
+        }
+
+    def _eval(self, node: ast.expr) -> Any:
+        """
+        Cached evaluation, raising `_Failure` with the reason, the blocking
+        node and the path relative to `node` when evaluation is impossible.
+        """
+
+        cached = self._cache.get(node, _unknown)
+        if cached is not _unknown:
+            if isinstance(cached, _CachedFailure):
+                raise _Failure(cached.reason, cached.node, *cached.path)
+            return cached
+
+        try:
+            result = self._handle(node)
+        except _Failure as failure:
+            self._cache[node] = _CachedFailure(failure.reason, failure.node, failure.path)
+            raise
+        self._cache[node] = result
+        return result
+
+    def _child(self, node: ast.expr, *path: Any) -> Any:
+        """
+        Evaluate a child node, prepending the given field/index path segments
+        to a failure so that paths are rebuilt per request without reusing
+        paths cached for a different parent expression.
+        """
+
+        try:
+            return self._eval(node)
+        except _Failure as failure:
+            if path:
+                failure.path = (*path, *failure.path)
             raise
 
     def _handle(self, node: ast.expr) -> Any:
         """
         This is where the evaluation happens.
         Users should use `__getitem__`, i.e. `evaluator[node]`,
-        as it provides caching.
+        or `explain`, as it provides caching.
 
         :param node: an AST expression to evaluate
         :return: the value of the node
@@ -89,11 +207,13 @@ class Evaluator:
             try:
                 return self.names[node.id]
             except KeyError:
-                raise CannotEval
+                raise _Failure(MISSING_NAME, node)
         elif isinstance(node, ast.Attribute):
-            value = self[node.value]
-            attr = node.attr
-            return getattr_static(value, attr)
+            value = self._child(node.value, "value")
+            try:
+                return getattr_static(value, node.attr)
+            except CannotEval as e:
+                raise _Failure(e.reason or UNSAFE_OPERATION, node)
         elif isinstance(node, ast.Subscript):
             return self._handle_subscript(node)
         elif isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
@@ -108,13 +228,22 @@ class Evaluator:
             return self._handle_compare(node)
         elif isinstance(node, ast.Call):
             return self._handle_call(node)
-        raise CannotEval
+        raise _Failure(UNSUPPORTED_SYNTAX, node)
 
     def _handle_call(self, node):
         if node.keywords:
-            raise CannotEval
-        func = self[node.func]
-        args = [self[arg] for arg in node.args]
+            raise _Failure(UNSUPPORTED_SYNTAX, node)
+        func = self._child(node.func, "func")
+        args = [
+            self._child(arg, "args", i)
+            for i, arg in enumerate(node.args)
+        ]
+
+        def check_arg(arg, i):
+            try:
+                return of_standard_types(arg, check_dict_values=False, deep=False)
+            except CannotEval:
+                raise _Failure(UNSAFE_OPERATION, node.args[i], "args", i)
 
         if (
             is_any(
@@ -141,47 +270,53 @@ class Evaluator:
             or len(args) >= 2
             and is_any(func, str, divmod, bytes, bytearray, pow)
         ):
-            args = [
-                of_standard_types(arg, check_dict_values=False, deep=False)
-                for arg in args
-            ]
+            args = [check_arg(arg, i) for i, arg in enumerate(args)]
             try:
                 return func(*args)
-            except Exception as e:
-                raise CannotEval from e
+            except Exception:
+                raise _Failure(OPERATION_ERROR, node)
 
         if len(args) == 1:
             arg = args[0]
+            arg_node = node.args[0]
             if is_any(func, id, type):
                 try:
                     return func(arg)
-                except Exception as e:
-                    raise CannotEval from e
+                except Exception:
+                    raise _Failure(OPERATION_ERROR, node)
             if is_any(func, all, any, sum):
-                of_type(arg, tuple, frozenset, list, set, dict, OrderedDict, deque)
-                for x in arg:
-                    of_standard_types(x, check_dict_values=False, deep=False)
+                try:
+                    of_type(arg, tuple, frozenset, list, set, dict, OrderedDict, deque)
+                    for x in arg:
+                        of_standard_types(x, check_dict_values=False, deep=False)
+                except CannotEval:
+                    raise _Failure(UNSAFE_OPERATION, arg_node, "args", 0)
                 try:
                     return func(arg)
-                except Exception as e:
-                    raise CannotEval from e
+                except Exception:
+                    raise _Failure(OPERATION_ERROR, node)
 
             if is_any(
                 func, sorted, min, max, hash, set, dict, ascii, str, repr, frozenset
             ):
-                of_standard_types(arg, check_dict_values=True, deep=True)
+                try:
+                    of_standard_types(arg, check_dict_values=True, deep=True)
+                except CannotEval:
+                    raise _Failure(UNSAFE_OPERATION, arg_node, "args", 0)
                 try:
                     return func(arg)
-                except Exception as e:
-                    raise CannotEval from e
-        raise CannotEval
+                except Exception:
+                    raise _Failure(OPERATION_ERROR, node)
+        raise _Failure(UNSAFE_OPERATION, node.func, "func")
 
     def _handle_compare(self, node):
-        left = self[node.left]
+        left = self._child(node.left, "left")
+        left_node = node.left
+        left_path = ("left",)
         result = True
 
-        for op, right in zip(node.ops, node.comparators):
-            right = self[right]
+        for i, (op, right_node) in enumerate(zip(node.ops, node.comparators)):
+            right = self._child(right_node, "comparators", i)
 
             op_type = type(op)
             op_func = {
@@ -198,36 +333,55 @@ class Evaluator:
             }[op_type]
 
             if op_type not in (ast.Is, ast.IsNot):
-                of_standard_types(left, check_dict_values=False, deep=True)
-                of_standard_types(right, check_dict_values=False, deep=True)
+                try:
+                    of_standard_types(left, check_dict_values=False, deep=True)
+                except CannotEval:
+                    raise _Failure(UNSAFE_OPERATION, left_node, *left_path)
+                try:
+                    of_standard_types(right, check_dict_values=False, deep=True)
+                except CannotEval:
+                    raise _Failure(UNSAFE_OPERATION, right_node, "comparators", i)
 
             try:
                 result = op_func(left, right)
-            except Exception as e:
-                raise CannotEval from e
+            except Exception:
+                raise _Failure(OPERATION_ERROR, node)
             if not result:
                 return result
             left = right
+            left_node = right_node
+            left_path = ("comparators", i)
 
         return result
 
     def _handle_boolop(self, node):
-        left = of_standard_types(
-            self[node.values[0]], check_dict_values=False, deep=False
-        )
+        try:
+            left = of_standard_types(
+                self._child(node.values[0], "values", 0),
+                check_dict_values=False,
+                deep=False,
+            )
+        except CannotEval:
+            raise _Failure(UNSAFE_OPERATION, node.values[0], "values", 0)
 
-        for right in node.values[1:]:
+        for i, right_node in enumerate(node.values[1:], start=1):
             # We need short circuiting so that the whole operation can be evaluated
             # even if the right operand can't
+            def evaluate_right():
+                try:
+                    return of_standard_types(
+                        self._child(right_node, "values", i),
+                        check_dict_values=False,
+                        deep=False,
+                    )
+                except CannotEval:
+                    raise _Failure(UNSAFE_OPERATION, right_node, "values", i)
+
             if isinstance(node.op, ast.Or):
-                left = left or of_standard_types(
-                    self[right], check_dict_values=False, deep=False
-                )
+                left = left or evaluate_right()
             else:
                 assert isinstance(node.op, ast.And)
-                left = left and of_standard_types(
-                    self[right], check_dict_values=False, deep=False
-                )
+                left = left and evaluate_right()
         return left
 
     def _handle_binop(self, node):
@@ -247,63 +401,91 @@ class Evaluator:
             ast.BitAnd: operator.and_,
         }.get(op_type)
         if not op:
-            raise CannotEval
-        left = self[node.left]
-        hash_type = is_any(type(left), set, frozenset, dict, OrderedDict)
-        left = of_standard_types(left, check_dict_values=False, deep=hash_type)
-        formatting = type(left) in (str, bytes) and op_type == ast.Mod
+            raise _Failure(UNSUPPORTED_SYNTAX, node)
+        left_value = self._child(node.left, "left")
+        hash_type = is_any(type(left_value), set, frozenset, dict, OrderedDict)
+        try:
+            left = of_standard_types(left_value, check_dict_values=False, deep=hash_type)
+        except CannotEval:
+            raise _Failure(UNSAFE_OPERATION, node.left, "left")
+        formatting = type(left_value) in (str, bytes) and op_type == ast.Mod
 
-        right = of_standard_types(
-            self[node.right],
-            check_dict_values=formatting,
-            deep=formatting or hash_type,
-        )
+        try:
+            right = of_standard_types(
+                self._child(node.right, "right"),
+                check_dict_values=formatting,
+                deep=formatting or hash_type,
+            )
+        except CannotEval:
+            raise _Failure(UNSAFE_OPERATION, node.right, "right")
         try:
             return op(left, right)
-        except Exception as e:
-            raise CannotEval from e
+        except Exception:
+            raise _Failure(OPERATION_ERROR, node)
 
     def _handle_unary(self, node: ast.UnaryOp):
-        value = of_standard_types(
-            self[node.operand], check_dict_values=False, deep=False
-        )
+        try:
+            value = of_standard_types(
+                self._child(node.operand, "operand"),
+                check_dict_values=False,
+                deep=False,
+            )
+        except CannotEval:
+            raise _Failure(UNSAFE_OPERATION, node.operand, "operand")
         op_type = type(node.op)
         op = {
             ast.USub: operator.neg,
             ast.UAdd: operator.pos,
             ast.Not: operator.not_,
             ast.Invert: operator.invert,
-        }[op_type]
+        }.get(op_type)
+        if op is None:
+            raise _Failure(UNSUPPORTED_SYNTAX, node)
         try:
             return op(value)
-        except Exception as e:
-            raise CannotEval from e
+        except Exception:
+            raise _Failure(OPERATION_ERROR, node)
 
     def _handle_subscript(self, node):
-        value = self[node.value]
-        of_standard_types(
-            value, check_dict_values=False, deep=is_any(type(value), dict, OrderedDict)
-        )
-        index = node.slice
-        if isinstance(index, ast.Slice):
-            index = slice(
-                *[
-                    None if p is None else self[p]
-                    for p in [index.lower, index.upper, index.step]
-                ]
+        value = self._child(node.value, "value")
+        try:
+            of_standard_types(
+                value, check_dict_values=False, deep=is_any(type(value), dict, OrderedDict)
             )
-        elif isinstance(index, ast.ExtSlice):
-            raise CannotEval
+        except CannotEval:
+            raise _Failure(UNSAFE_OPERATION, node.value, "value")
+
+        slice_node = node.slice
+        if isinstance(slice_node, ast.Slice):
+            index_node = slice_node
+            index_path = ("slice",)
+            parts = []
+            for part_name in ("lower", "upper", "step"):
+                part = getattr(slice_node, part_name)
+                if part is None:
+                    parts.append(None)
+                else:
+                    parts.append(self._child(part, "slice", part_name))
+            index = slice(*parts)
+        elif isinstance(slice_node, ast.ExtSlice):
+            raise _Failure(UNSUPPORTED_SYNTAX, node)
         else:
-            if isinstance(index, ast.Index):
-                index = index.value
-            index = self[index]
-        of_standard_types(index, check_dict_values=False, deep=True)
+            if isinstance(slice_node, ast.Index):
+                index_node = slice_node.value
+                index_path = ("slice", "value")
+            else:
+                index_node = slice_node
+                index_path = ("slice",)
+            index = self._child(index_node, *index_path)
+        try:
+            of_standard_types(index, check_dict_values=False, deep=True)
+        except CannotEval:
+            raise _Failure(UNSAFE_OPERATION, index_node, *index_path)
 
         try:
             return value[index]
         except Exception:
-            raise CannotEval
+            raise _Failure(OPERATION_ERROR, node)
 
     def _handle_container(
             self,
@@ -311,36 +493,46 @@ class Evaluator:
     ) -> Union[List, Tuple, Set, Dict]:
         """Handle container nodes, including List, Set, Tuple and Dict"""
         if isinstance(node, ast.Dict):
-            elts = node.keys
-            if None in elts:  # ** unpacking inside {}, not yet supported
-                raise CannotEval
+            if None in node.keys:  # ** unpacking inside {}, not yet supported
+                raise _Failure(UNSUPPORTED_SYNTAX, node)
+            elts = [
+                self._child(key, "keys", i)
+                for i, key in enumerate(node.keys)
+            ]
         else:
-            elts = node.elts
-        elts = [self[elt] for elt in elts]
+            elts = [
+                self._child(elt, "elts", i)
+                for i, elt in enumerate(node.elts)
+            ]
         if isinstance(node, ast.List):
             return elts
         if isinstance(node, ast.Tuple):
             return tuple(elts)
 
         # Set and Dict
-        if not all(
-            is_standard_types(elt, check_dict_values=False, deep=True) for elt in elts
-        ):
-            raise CannotEval
+        for i, elt in enumerate(elts):
+            if not is_standard_types(elt, check_dict_values=False, deep=True):
+                if isinstance(node, ast.Dict):
+                    raise _Failure(UNSAFE_OPERATION, node.keys[i], "keys", i)
+                else:
+                    raise _Failure(UNSAFE_OPERATION, node.elts[i], "elts", i)
 
         if isinstance(node, ast.Set):
             try:
                 return set(elts)
             except TypeError:
-                raise CannotEval
+                raise _Failure(OPERATION_ERROR, node)
 
         assert isinstance(node, ast.Dict)
 
-        pairs = [(elt, self[val]) for elt, val in zip(elts, node.values)]
+        pairs = [
+            (elt, self._child(val, "values", i))
+            for i, (elt, val) in enumerate(zip(elts, node.values))
+        ]
         try:
             return dict(pairs)
         except TypeError:
-            raise CannotEval
+            raise _Failure(OPERATION_ERROR, node)
 
     def find_expressions(self, root: ast.AST) -> Iterable[Tuple[ast.expr, Any]]:
         """

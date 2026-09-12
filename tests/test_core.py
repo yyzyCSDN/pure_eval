@@ -469,3 +469,225 @@ def test_cannot_subscript(expr):
     assert isinstance(node, ast.Subscript)
     with pytest.raises(CannotEval):
         str(evaluator[node])
+
+
+def parse_expr(source):
+    return ast.parse(source, mode="eval").body
+
+
+def test_explain_success():
+    x = 1
+    evaluator = Evaluator.from_frame(inspect.currentframe())
+    node = parse_expr("x + 1")
+    assert evaluator.explain(node) == {
+        "ok": True,
+        "value": 2,
+        "reason": None,
+        "node": None,
+        "path": None,
+    }
+    # The original entry point is unchanged
+    assert evaluator[node] == 2
+    # Falsy/None values are proper cached successes, not missing entries
+    for source, value in [("0", 0), ("False", False), ("None", None), ("''", "")]:
+        assert evaluator.explain(parse_expr(source))["value"] == value
+
+
+@pytest.mark.parametrize("source, reason", [
+    ("missing", "missing_name"),
+    ("[i for i in ()]", "unsupported_syntax"),
+    ("lambda: 0", "unsupported_syntax"),
+    ("int(x=1)", "unsupported_syntax"),
+    ("int(*[1])", "unsupported_syntax"),
+    ("{**{}}", "unsupported_syntax"),
+    ("1 / 0", "operation_error"),
+    ("[][0]", "operation_error"),
+    ("{}[1]", "operation_error"),
+    ("int('x')", "operation_error"),
+])
+def test_explain_reasons(source, reason):
+    evaluator = Evaluator.from_frame(inspect.currentframe())
+    node = parse_expr(source)
+    result = evaluator.explain(node)
+    assert result["ok"] is False
+    assert result["value"] is None
+    assert result["reason"] == reason
+    assert isinstance(result["node"], ast.AST)
+    assert isinstance(result["path"], tuple)
+    assert set(result) == {"ok", "value", "reason", "node", "path"}
+    # The original entry point still raises CannotEval for the same node
+    with pytest.raises(CannotEval):
+        evaluator[node]
+
+
+def test_explain_unsafe_operation():
+    class Foo:
+        @property
+        def prop(self):
+            raise AssertionError("user property must not be invoked")
+
+    foo = Foo()
+    evaluator = Evaluator.from_frame(inspect.currentframe())
+
+    node = parse_expr("foo.prop")
+    result = evaluator.explain(node)
+    assert result["reason"] == "unsafe_operation"
+    assert result["node"] is node
+    assert result["path"] == ()
+    # Explaining again uses the cache and still does not call the property
+    assert evaluator.explain(node)["reason"] == "unsafe_operation"
+
+    node = parse_expr("print(1)")
+    result = evaluator.explain(node)
+    assert result["reason"] == "unsafe_operation"
+    assert result["node"] is node.func
+    assert result["path"] == ("func",)
+
+
+def test_explain_missing_attribute_is_operation_error():
+    class Foo:
+        pass
+
+    foo = Foo()
+    evaluator = Evaluator.from_frame(inspect.currentframe())
+    node = parse_expr("foo.absent")
+    result = evaluator.explain(node)
+    assert result["reason"] == "operation_error"
+    assert result["node"] is node
+    assert result["path"] == ()
+
+
+def test_explain_paths():
+    evaluator = Evaluator({"lst": [1], "print": print})
+
+    node = parse_expr("missing")
+    assert evaluator.explain(node)["path"] == ()
+
+    node = parse_expr("False or missing")
+    result = evaluator.explain(node)
+    assert result["path"] == ("values", 1)
+    assert result["node"] is node.values[1]
+
+    node = parse_expr("1 + missing")
+    result = evaluator.explain(node)
+    assert result["path"] == ("right",)
+    assert result["node"] is node.right
+
+    node = parse_expr("missing + 1")
+    assert evaluator.explain(node)["path"] == ("left",)
+
+    node = parse_expr("-missing")
+    assert evaluator.explain(node)["path"] == ("operand",)
+
+    node = parse_expr("1 < missing")
+    result = evaluator.explain(node)
+    assert result["path"] == ("comparators", 0)
+    assert result["node"] is node.comparators[0]
+
+    node = parse_expr("missing(1)")
+    result = evaluator.explain(node)
+    assert result["path"] == ("func",)
+    assert result["node"] is node.func
+
+    node = parse_expr("print(missing)")
+    result = evaluator.explain(node)
+    assert result["path"] == ("args", 0)
+    assert result["node"] is node.args[0]
+
+    node = parse_expr("(missing, 1)")
+    result = evaluator.explain(node)
+    assert result["path"] == ("elts", 0)
+    assert result["node"] is node.elts[0]
+
+    node = parse_expr("lst[:missing]")
+    result = evaluator.explain(node)
+    assert result["path"] == ("slice", "upper")
+    assert result["node"] is node.slice.upper
+
+    node = parse_expr("(missing, 1)[0]")
+    result = evaluator.explain(node)
+    assert result["path"] == ("value", "elts", 0)
+    assert result["node"] is node.value.elts[0]
+
+
+def test_explain_short_circuit():
+    # No names at all, yet the unexecuted branches are never inspected
+    evaluator = Evaluator({})
+
+    result = evaluator.explain(parse_expr("1 or missing"))
+    assert result["ok"] and result["value"] == 1
+
+    result = evaluator.explain(parse_expr("0 and missing"))
+    assert result["ok"] and result["value"] == 0
+
+    node = parse_expr("1 == 2 == missing")
+    result = evaluator.explain(node)
+    assert result["ok"] and result["value"] is False
+
+    node = parse_expr("1 == 1 == missing")
+    result = evaluator.explain(node)
+    assert result["reason"] == "missing_name"
+    assert result["path"] == ("comparators", 1)
+
+
+def test_explain_failure_cached_by_getitem():
+    evaluator = Evaluator({})
+    node = parse_expr("missing")
+    with pytest.raises(CannotEval):
+        evaluator[node]
+    result = evaluator.explain(node)
+    assert result["reason"] == "missing_name"
+    assert result["node"] is node
+    assert result["path"] == ()
+
+
+def test_explain_cached_failure_is_not_reevaluated(monkeypatch):
+    import pure_eval.core as core
+
+    calls = []
+
+    def counting_truediv(a, b):
+        calls.append((a, b))
+        return a / b
+
+    monkeypatch.setattr(core.operator, "truediv", counting_truediv)
+    evaluator = Evaluator({})
+    node = parse_expr("1 / 0")
+    first = evaluator.explain(node)
+    second = evaluator.explain(node)
+    assert first["reason"] == second["reason"] == "operation_error"
+    assert first["node"] is second["node"] is node
+    assert len(calls) == 1
+    with pytest.raises(CannotEval):
+        evaluator[node]
+    assert len(calls) == 1
+
+
+def test_explain_path_rebuilt_per_request_root():
+    evaluator = Evaluator({})
+    missing = ast.Name(id="missing", ctx=ast.Load())
+    bool_root = ast.BoolOp(ast.Or(), [ast.Constant(0), missing])
+    bin_root = ast.BinOp(ast.Constant(1), ast.Add(), missing)
+
+    assert evaluator.explain(bool_root)["path"] == ("values", 1)
+    assert evaluator.explain(bin_root)["path"] == ("right",)
+    assert evaluator.explain(missing)["path"] == ()
+
+    # A child failing first (via __getitem__) still yields the path from a
+    # different request root without re-evaluating the child
+    evaluator = Evaluator({"d": {}})
+    inner = parse_expr("d['x']")
+    with pytest.raises(CannotEval):
+        evaluator[inner]
+    outer = ast.BinOp(inner, ast.Add(), ast.Constant(1))
+    result = evaluator.explain(outer)
+    assert result["reason"] == "operation_error"
+    assert result["node"] is inner
+    assert result["path"] == ("left",)
+
+
+def test_explain_wrong_type():
+    evaluator = Evaluator({})
+    with pytest.raises(TypeError, match="ast.expr"):
+        # noinspection PyTypeChecker
+        evaluator.explain("foo")

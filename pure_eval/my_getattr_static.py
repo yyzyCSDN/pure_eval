@@ -1,6 +1,11 @@
 import types
 
-from pure_eval.utils import of_type, CannotEval
+from pure_eval.utils import (
+    of_type,
+    CannotEval,
+    UNSAFE_OPERATION,
+    OPERATION_ERROR,
+)
 
 _sentinel = object()
 
@@ -72,7 +77,7 @@ def getattr_static(obj, attr):
                 type(dict_attr) is types.MemberDescriptorType or type(dict_attr) is types.GetSetDescriptorType):
             instance_result = _check_instance(obj, attr)
         else:
-            raise CannotEval
+            raise CannotEval(UNSAFE_OPERATION)
     else:
         klass = obj
 
@@ -106,11 +111,11 @@ def getattr_static(obj, attr):
                     result = entry.__dict__[attr]
                     get = _check_class(type(result), '__get__')
                     if get is not _sentinel:
-                        raise CannotEval
+                        raise CannotEval(UNSAFE_OPERATION)
                     return result
                 except KeyError:
                     pass
-    raise CannotEval
+    raise CannotEval(OPERATION_ERROR)
 
 
 class _foo:
@@ -135,6 +140,10 @@ safe_descriptor_types = list(map(type, safe_descriptors_raw))
 
 def _resolve_descriptor(d, instance, owner):
     try:
-        return type(of_type(d, *safe_descriptor_types)).__get__(d, instance, owner)
-    except AttributeError as e:
-        raise CannotEval from e
+        d = of_type(d, *safe_descriptor_types)
+    except CannotEval:
+        raise CannotEval(UNSAFE_OPERATION)
+    try:
+        return type(d).__get__(d, instance, owner)
+    except AttributeError:
+        raise CannotEval(OPERATION_ERROR)

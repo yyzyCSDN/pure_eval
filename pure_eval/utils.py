@@ -7,7 +7,18 @@ import enum
 import typing
 
 
+# Possible reasons why an expression cannot be evaluated, see Evaluator.explain
+MISSING_NAME = "missing_name"
+UNSUPPORTED_SYNTAX = "unsupported_syntax"
+UNSAFE_OPERATION = "unsafe_operation"
+OPERATION_ERROR = "operation_error"
+
+
 class CannotEval(Exception):
+    def __init__(self, reason=None):
+        super().__init__(reason)
+        self.reason = reason
+
     def __repr__(self):
         return self.__class__.__name__
 
