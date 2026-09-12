@@ -14,6 +14,16 @@ class CannotEval(Exception):
     __str__ = __repr__
 
 
+class EvaluationLimit(CannotEval):
+    """
+    Raised by Evaluator.evaluate_limited when the max_nodes budget is
+    exhausted before the next expression node could be processed.
+    It is never cached and every cache entry added during that call is
+    removed before it propagates, so the evaluation can be retried.
+    """
+    pass
+
+
 def is_any(x, *args):
     return any(
         x is arg

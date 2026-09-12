@@ -1,4 +1,10 @@
-from .core import Evaluator, CannotEval, group_expressions, is_expression_interesting
+from .core import (
+    Evaluator,
+    CannotEval,
+    EvaluationLimit,
+    group_expressions,
+    is_expression_interesting,
+)
 from .my_getattr_static import getattr_static
 
 try:
@@ -10,6 +16,7 @@ except ImportError:
 __all__ = [
     "Evaluator",
     "CannotEval",
+    "EvaluationLimit",
     "group_expressions",
     "is_expression_interesting",
     "getattr_static",

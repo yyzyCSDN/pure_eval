@@ -6,7 +6,7 @@ import typing
 import itertools
 import pytest
 
-from pure_eval import Evaluator, CannotEval
+from pure_eval import Evaluator, CannotEval, EvaluationLimit
 from pure_eval.core import is_expression_interesting, group_expressions
 
 
@@ -469,3 +469,239 @@ def test_cannot_subscript(expr):
     assert isinstance(node, ast.Subscript)
     with pytest.raises(CannotEval):
         str(evaluator[node])
+
+
+def parse_expr(source):
+    return ast.parse(source, mode="eval").body
+
+
+def test_evaluation_limit_inherits_cannot_eval():
+    assert issubclass(EvaluationLimit, CannotEval)
+    assert isinstance(EvaluationLimit(), CannotEval)
+    assert str(EvaluationLimit()) == "EvaluationLimit"
+
+
+def test_evaluate_limited_counts_every_node():
+    # a + b: BinOp root plus two Name nodes = 3 nodes
+    evaluator = Evaluator({'a': 10, 'b': 20})
+    tree = parse_expr('a + b')
+    assert evaluator.evaluate_limited(tree, max_nodes=3) == 30
+
+    # A successful limited call caches the root in the shared cache,
+    # so a subsequent call needs no budget at all.
+    assert evaluator.evaluate_limited(tree, max_nodes=0) == 30
+    assert evaluator[tree] == 30
+
+    evaluator = Evaluator({'a': 10, 'b': 20})
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=2)
+
+    # Nothing was cached by the failed limited call.
+    assert evaluator._cache == {}
+
+
+def test_evaluate_limited_root_is_billed():
+    evaluator = Evaluator({'a': 1})
+    tree = parse_expr('a')
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=0)
+    assert evaluator._cache == {}
+    assert evaluator.evaluate_limited(tree, max_nodes=1) == 1
+
+
+@pytest.mark.parametrize("source, count", [
+    ("123", 1),
+    ("-1", 2),  # UnaryOp root plus the Constant operand
+    ("[1, 2, 3]", 4),
+    ("(1, 2)", 3),
+    ("{1, 2}", 3),
+    ("{'a': 1}", 3),
+    ("[[1, 2]]", 4),
+    ("[1, [2, 3]]", 5),
+])
+def test_evaluate_limited_literal_containers(source, count):
+    tree = parse_expr(source)
+
+    evaluator = Evaluator({})
+    assert evaluator.evaluate_limited(tree, max_nodes=count) == ast.literal_eval(tree)
+    # Only the root is cached, the literal shortcut caches no children.
+    assert set(evaluator._cache) == {tree}
+
+    # One unit short: the literal shortcut cannot bypass the budget.
+    evaluator = Evaluator({})
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=count - 1)
+    assert evaluator._cache == {}
+
+
+def test_evaluate_limited_nested_evaluation_shares_budget():
+    # a + b + c: outer BinOp, inner BinOp and three Name nodes = 5
+    evaluator = Evaluator({'a': 1, 'b': 2, 'c': 3})
+    tree = parse_expr('a + b + c')
+    assert evaluator.evaluate_limited(tree, max_nodes=5) == 6
+    evaluator = Evaluator({'a': 1, 'b': 2, 'c': 3})
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=4)
+    assert evaluator._cache == {}
+
+
+def test_evaluate_limited_subscript_shares_cache():
+    lst = [10, 20, 30]
+    evaluator = Evaluator({'lst': lst})
+    tree = parse_expr('lst[1]')
+    # Subscript root, Name 'lst' and the index Constant = 3 expr nodes
+    assert evaluator.evaluate_limited(tree, max_nodes=3) == 20
+    # Root and children now live in the ordinary shared cache.
+    assert evaluator[tree] == 20
+
+    evaluator = Evaluator({'lst': lst})
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=2)
+    assert evaluator._cache == {}
+    # The ordinary unlimited entry works as a retry after rollback.
+    assert evaluator[tree] == 20
+
+
+def test_evaluate_limited_short_circuited_branches_free():
+    # The right operand of a short-circuiting bool op is never visited.
+    evaluator = Evaluator({})
+    assert evaluator.evaluate_limited(parse_expr('0 and nope'), max_nodes=2) == 0
+
+    evaluator = Evaluator({})
+    assert evaluator.evaluate_limited(parse_expr('1 or nope'), max_nodes=2) == 1
+
+    evaluator = Evaluator({})
+    assert evaluator.evaluate_limited(
+        parse_expr('0 and 2 and nope'), max_nodes=2
+    ) == 0
+
+    evaluator = Evaluator({})
+    assert evaluator.evaluate_limited(
+        parse_expr('1 or nope or nope'), max_nodes=2
+    ) == 1
+
+    # When the branch IS evaluated it costs budget (then CannotEval).
+    evaluator = Evaluator({})
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(parse_expr('1 and nope'), max_nodes=2)
+    evaluator = Evaluator({})
+    with pytest.raises(CannotEval):
+        evaluator.evaluate_limited(parse_expr('1 and nope'), max_nodes=3)
+
+
+def test_evaluate_limited_same_ast_object_billed_once():
+    # One Name object used as both operands.
+    name_x = ast.Name('x', ast.Load())
+    tree = ast.BinOp(name_x, ast.Add(), name_x)
+    evaluator = Evaluator({'x': 7})
+    assert evaluator.evaluate_limited(tree, max_nodes=2) == 14
+
+    evaluator = Evaluator({'x': 7})
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=1)
+
+    # One Constant object repeated inside a literal container.
+    const = ast.Constant(5)
+    tree = ast.List([const, const], ast.Load())
+    evaluator = Evaluator({})
+    assert evaluator.evaluate_limited(tree, max_nodes=2) == [5, 5]
+
+    evaluator = Evaluator({})
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=1)
+
+
+def test_evaluate_limited_cache_hits_are_free():
+    evaluator = Evaluator({'a': 10, 'b': 20})
+    tree = parse_expr('a + b')
+    # Pre-cache one operand: only the root and the other operand remain.
+    evaluator[tree.left]
+    assert evaluator.evaluate_limited(tree, max_nodes=2) == 30
+
+    evaluator = Evaluator({'a': 10, 'b': 20})
+    evaluator[tree.left]
+    with pytest.raises(EvaluationLimit):
+        evaluator.evaluate_limited(tree, max_nodes=1)
+
+    # A node already cached inside a literal subtree is a cache hit too.
+    const = ast.Constant(9)
+    evaluator = Evaluator({})
+    assert evaluator[const] == 9
+    tree = ast.List([const, const], ast.Load())
+    assert evaluator.evaluate_limited(tree, max_nodes=1) == [9, 9]
+
+
+def test_evaluate_limited_rollback_preserves_prior_cache():
+    # A distinct int object: usable in the arithmetic below while still
+    # letting us assert object identity through the cache.
+    sentinel = 10 ** 9
+    evaluator = Evaluator({'a': sentinel, 'b': 2, 'c': 3})
+    tree = parse_expr('a + b + c')
+    # Pre-cache the Name 'a' before the limited call.
+    name_a = tree.left.left
+    assert evaluator[name_a] is sentinel
+
+    with pytest.raises(EvaluationLimit):
+        # Outer BinOp, inner BinOp and Name b are new; Name c would be 5th.
+        evaluator.evaluate_limited(tree, max_nodes=3)
+
+    # The prior cache survives untouched, including object identity.
+    assert set(evaluator._cache) == {name_a}
+    assert evaluator._cache[name_a] is sentinel
+
+    # Retrying with a larger budget works.
+    assert evaluator.evaluate_limited(tree, max_nodes=4) == sentinel + 5
+
+
+def test_evaluate_limited_independent_calls_recount():
+    evaluator = Evaluator({'a': 10, 'b': 20})
+    tree = parse_expr('a + b')
+    for _ in range(3):
+        with pytest.raises(EvaluationLimit):
+            evaluator.evaluate_limited(tree, max_nodes=2)
+        assert evaluator._cache == {}
+    assert evaluator.evaluate_limited(tree, max_nodes=3) == 30
+    # After a success the root is cached, so a zero-budget call is a hit.
+    assert evaluator.evaluate_limited(tree, max_nodes=0) == 30
+
+
+def test_evaluate_limited_cannot_eval_caching_unchanged():
+    evaluator = Evaluator({})
+    tree = parse_expr('missing')
+    with pytest.raises(CannotEval):
+        evaluator.evaluate_limited(tree, max_nodes=10)
+    # A normal CannotEval is cached as a failure as before.
+    assert evaluator._cache[tree] is CannotEval
+    # The cached failure is a cache hit and needs no budget.
+    with pytest.raises(CannotEval):
+        evaluator.evaluate_limited(tree, max_nodes=0)
+
+    # Partial successes before a plain CannotEval stay cached.
+    evaluator = Evaluator({'a': 1})
+    tree = parse_expr('[a, missing]')
+    with pytest.raises(CannotEval):
+        evaluator.evaluate_limited(tree, max_nodes=10)
+    assert evaluator._cache[tree.elts[0]] == 1
+    assert evaluator._cache[tree] is CannotEval
+
+
+@pytest.mark.parametrize("bad_max_nodes", [
+    -1, True, False, 1.0, "1", None, (), [], object()
+])
+def test_evaluate_limited_invalid_max_nodes(bad_max_nodes):
+    evaluator = Evaluator({'a': 1})
+    tree = parse_expr('a')
+    with pytest.raises(ValueError):
+        evaluator.evaluate_limited(tree, max_nodes=bad_max_nodes)
+    # The rejection happens before any evaluation: cache untouched.
+    assert evaluator._cache == {}
+    # A valid call afterwards works normally.
+    assert evaluator.evaluate_limited(tree, max_nodes=1) == 1
+
+
+def test_evaluate_limited_wrong_node_type():
+    evaluator = Evaluator({})
+    with pytest.raises(TypeError, match="node should be an ast.expr"):
+        # noinspection PyTypeChecker
+        evaluator.evaluate_limited("a", max_nodes=5)
+    assert evaluator._cache == {}
