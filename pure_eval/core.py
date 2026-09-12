@@ -4,7 +4,7 @@ import operator
 from collections import ChainMap, OrderedDict, deque
 from contextlib import suppress
 from types import FrameType
-from typing import Any, Tuple, Iterable, List, Mapping, Dict, Union, Set
+from typing import Any, Tuple, Iterable, List, Mapping, Dict, Union, Set, FrozenSet
 
 from pure_eval.my_getattr_static import getattr_static
 from pure_eval.utils import (
@@ -30,6 +30,14 @@ class Evaluator:
 
         self.names = names
         self._cache = {}  # type: Dict[ast.expr, Any]
+        # Maps each cached node to the names that were actually read in order
+        # to evaluate it. This is what invalidate_names() uses to decide
+        # which cached entries must be dropped.
+        self._dependencies = {}  # type: Dict[ast.expr, FrozenSet[str]]
+        # Stack of mutable dependency sets for nodes currently being evaluated
+        # on a cache miss. Dependencies read by child nodes propagate into the
+        # set of the parent expression being evaluated.
+        self._dependency_stack = []  # type: List[Set[str]]
 
     @classmethod
     def from_frame(cls, frame: FrameType) -> 'Evaluator':
@@ -60,17 +68,50 @@ class Evaluator:
 
         with suppress(KeyError):
             result = self._cache[node]
+            # This node was actually read while evaluating a parent node,
+            # so its dependencies count as dependencies of that parent too.
+            # This must happen even when result is CannotEval, so that a cached
+            # failure can be retried after one of its names is supplied.
+            self._add_dependencies(node)
             if result is CannotEval:
                 raise CannotEval
             else:
                 return result
 
+        dependencies = set()  # type: Set[str]
+        self._dependency_stack.append(dependencies)
         try:
-            self._cache[node] = result = self._handle(node)
-            return result
-        except CannotEval:
-            self._cache[node] = CannotEval
-            raise
+            try:
+                self._cache[node] = result = self._handle(node)
+                return result
+            except CannotEval:
+                self._cache[node] = CannotEval
+                raise
+        finally:
+            self._dependency_stack.pop()
+            frozen_dependencies = frozenset(dependencies)
+            # Replace any previous dependency information with the names that
+            # were actually read on this evaluation, so e.g. a newly taken
+            # branch of a BoolOp does not leave stale associations behind.
+            self._dependencies[node] = frozen_dependencies
+            if self._dependency_stack:
+                self._dependency_stack[-1].update(frozen_dependencies)
+
+    def _add_dependencies(self, node: ast.expr) -> None:
+        """
+        Propagate the cached dependencies of a child node that was just read
+        to the parent expression currently being evaluated on a cache miss.
+        """
+        if self._dependency_stack:
+            self._dependency_stack[-1].update(self._dependencies[node])
+
+    def _read_name(self, name: str) -> None:
+        """
+        Record that the name binding ``name`` was about to be read,
+        whether or not the read ends up succeeding.
+        """
+        if self._dependency_stack:
+            self._dependency_stack[-1].add(name)
 
     def _handle(self, node: ast.expr) -> Any:
         """
@@ -86,6 +127,10 @@ class Evaluator:
             return ast.literal_eval(node)
 
         if isinstance(node, ast.Name):
+            # Record the read before looking the name up, so that a missing
+            # binding (KeyError -> CannotEval) still depends on the name and
+            # can be evaluated once the binding is added.
+            self._read_name(node.id)
             try:
                 return self.names[node.id]
             except KeyError:
@@ -384,6 +429,59 @@ class Evaluator:
             for pair in self.find_expressions(root)
             if is_expression_interesting(*pair)
         )
+
+    def invalidate_names(self, names: Iterable[str]) -> None:
+        """
+        Drop cached results that depend on the given variable ``names``.
+
+        Call this after updating the ``names`` mapping passed to the
+        Evaluator (adding, replacing, or deleting bindings) so that affected
+        expressions, including cached ``CannotEval`` results, are evaluated
+        again on their next access. Cached results that did not actually read
+        any of the ``names`` are left untouched and keep their object identity.
+
+        Only names that were actually read are dependencies: operands skipped
+        by ``and``/``or`` short-circuiting or by chained comparisons are not
+        tracked. Re-evaluating an expression replaces its old dependencies
+        with the names read on the new evaluation.
+
+        This does not track internal mutations of already bound objects;
+        it only accounts for bindings being added, replaced, or removed.
+
+        :param names: an iterable of str names. A single str or bytes is
+                      rejected with TypeError rather than treated as a
+                      sequence of characters, and every element must be a str.
+                      Any other error raised while iterating is propagated
+                      unchanged. Duplicate names are handled once.
+        """
+
+        if isinstance(names, (str, bytes)):
+            raise TypeError(
+                "names must be an iterable of str, "
+                "not a single {}".format(type(names).__name__)
+            )
+
+        # Materialise and validate everything before touching the cache,
+        # so that a validation or iteration failure cannot leave the cache
+        # partially invalidated.
+        unique_names = set()  # type: Set[str]
+        for name in names:
+            if not isinstance(name, str):
+                raise TypeError(
+                    "every element of names must be a str, "
+                    "found {}".format(type(name).__name__)
+                )
+            unique_names.add(name)
+
+        # Snapshot the nodes first, entries are removed from the dict below.
+        affected = [
+            node
+            for node, dependencies in self._dependencies.items()
+            if not dependencies.isdisjoint(unique_names)
+        ]
+        for node in affected:
+            self._cache.pop(node, None)
+            del self._dependencies[node]
 
 
 def is_expression_interesting(node: ast.expr, value: Any) -> bool:

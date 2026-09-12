@@ -469,3 +469,317 @@ def test_cannot_subscript(expr):
     assert isinstance(node, ast.Subscript)
     with pytest.raises(CannotEval):
         str(evaluator[node])
+
+
+def parsed(source):
+    return ast.parse(source).body[0].value
+
+
+def test_invalidate_names_replacement_propagates_to_parents():
+    x = 1
+    y = [2]
+    names = {'x': x, 'y': y}
+    evaluator = Evaluator(names)
+    node = parsed('(x, y)')
+
+    result = evaluator[node]
+    assert result == (1, y)
+    cached_x = evaluator[node.elts[0]]
+    cached_y = evaluator[node.elts[1]]
+    assert cached_x == 1
+    assert cached_y is y
+
+    names['x'] = 10
+    evaluator.invalidate_names(['x'])
+
+    assert evaluator[node] == (10, y)
+    # The unaffected y node is served from the old cache with object identity.
+    assert evaluator[node.elts[1]] is y
+    # The rebuilt container still contains that very same object.
+    assert evaluator[node][1] is y
+    # The x node was invalidated and re-evaluated.
+    assert evaluator[node.elts[0]] == 10
+    assert evaluator[node.elts[0]] is not cached_x
+
+
+def test_invalidate_names_unaffected_cache_keeps_identity():
+    sentinel = object()
+    names = {'x': 1, 'obj': sentinel}
+    evaluator = Evaluator(names)
+    node = parsed('obj')
+    literal = parsed('123')
+
+    assert evaluator[node] is sentinel
+    assert evaluator[literal] == 123
+
+    evaluator.invalidate_names(['x'])
+    assert evaluator[node] is sentinel
+    assert evaluator[literal] == 123
+    assert node in evaluator._cache
+
+
+def test_invalidate_names_add_binding_retries_cannot_eval():
+    names = {}
+    evaluator = Evaluator(names)
+    node = parsed('x + 1')
+
+    with pytest.raises(CannotEval):
+        evaluator[node]
+    with pytest.raises(CannotEval):
+        evaluator[node.left]
+    assert node in evaluator._cache
+    assert node.left in evaluator._cache
+
+    # Adding the previously missing name invalidates both the Name node and
+    # the parent expression whose cached result was CannotEval.
+    names['x'] = 41
+    evaluator.invalidate_names(['x'])
+    assert node not in evaluator._cache
+    assert node.left not in evaluator._cache
+
+    assert evaluator[node.left] == 41
+    assert evaluator[node] == 42
+
+
+def test_invalidate_names_delete_binding():
+    names = {'x': 5}
+    evaluator = Evaluator(names)
+    node = parsed('x')
+    assert evaluator[node] == 5
+
+    del names['x']
+    evaluator.invalidate_names(['x'])
+    with pytest.raises(CannotEval):
+        evaluator[node]
+
+    # Adding it back lets the cached failure be evaluated again.
+    names['x'] = 6
+    evaluator.invalidate_names(['x'])
+    assert evaluator[node] == 6
+
+
+def test_invalidate_names_subscript():
+    names = {'d': {1: 2}, 'k': 1}
+    evaluator = Evaluator(names)
+    node = parsed('d[k]')
+
+    assert evaluator[node] == 2
+
+    names['d'] = {1: 3}
+    evaluator.invalidate_names(['d'])
+    assert evaluator[node] == 3
+
+    # Changing k to a missing key makes evaluation fail.
+    names['k'] = 5
+    evaluator.invalidate_names(['k'])
+    with pytest.raises(CannotEval):
+        evaluator[node]
+
+    # And a valid k again makes it succeed.
+    names['k'] = 1
+    evaluator.invalidate_names(['k'])
+    assert evaluator[node] == 3
+
+
+def test_invalidate_names_attribute_binding():
+    class Box:
+        pass
+
+    box = Box()
+    box.attr = 1
+    other = Box()
+    other.attr = 5
+
+    names = {'box': box}
+    evaluator = Evaluator(names)
+    node = parsed('box.attr')
+
+    assert evaluator[node] == 1
+
+    # Internal mutation of a bound object is deliberately NOT tracked.
+    box.attr = 2
+    assert evaluator[node] == 1
+
+    # Replacing the binding and explicitly invalidating does re-evaluate.
+    names['box'] = other
+    evaluator.invalidate_names(['box'])
+    assert evaluator[node] == 5
+
+
+def test_invalidate_names_boolop_short_circuit():
+    names = {'flag': 1, 'a': 100}
+    evaluator = Evaluator(names)
+    node = parsed('flag or a')
+
+    assert evaluator[node] == 1
+    # The unread right operand was never evaluated.
+    assert node.values[1] not in evaluator._cache
+
+    # Invalidating an unread name leaves the cached result untouched.
+    names['a'] = 101
+    evaluator.invalidate_names(['a'])
+    assert evaluator[node] == 1
+    assert node in evaluator._cache
+
+    # Taking the other branch records fresh dependencies.
+    names['flag'] = 0
+    evaluator.invalidate_names(['flag'])
+    assert evaluator[node] == 101
+
+    # The new branch association must have replaced the old one: invalidating
+    # 'a' now invalidates the whole Or expression.
+    names['a'] = 111
+    evaluator.invalidate_names(['a'])
+    assert evaluator[node] == 111
+
+
+def test_invalidate_names_boolop_and_short_circuit():
+    names = {'flag': 0, 'a': 100}
+    evaluator = Evaluator(names)
+    node = parsed('flag and a')
+
+    assert evaluator[node] == 0
+    assert node.values[1] not in evaluator._cache
+
+    names['a'] = 101
+    evaluator.invalidate_names(['a'])
+    assert evaluator[node] == 0
+
+    names['flag'] = 1
+    evaluator.invalidate_names(['flag'])
+    assert evaluator[node] == 101
+
+    names['a'] = 111
+    evaluator.invalidate_names(['a'])
+    assert evaluator[node] == 111
+
+
+def test_invalidate_names_chained_compare_short_circuit():
+    names = {'a': 1, 'b': 0, 'c': 999}
+    evaluator = Evaluator(names)
+    node = parsed('a < b < c')
+
+    result = evaluator[node]
+    assert result is False
+    # The comparator after the failing comparison was never read.
+    assert node.comparators[1] not in evaluator._cache
+
+    # Invalidating the unread name 'c' keeps the exact cached result object.
+    names['c'] = -5
+    evaluator.invalidate_names(['c'])
+    assert evaluator[node] is result
+
+    # Making the first comparison pass reads c on the next evaluation:
+    # 1 < 2 is True, then 2 < -5 is False.
+    names['b'] = 2
+    evaluator.invalidate_names(['b'])
+    assert evaluator[node] is False
+
+    # c is now a genuine dependency (it was not before), so invalidating it
+    # re-evaluates the whole chained comparison.
+    names['c'] = 3
+    evaluator.invalidate_names(['c'])
+    assert evaluator[node] is True
+
+
+def test_invalidate_names_with_find_expressions():
+    names = {'x': 1, 'y': 2}
+    evaluator = Evaluator(names)
+    root = parsed('x + y')
+
+    assert dict(evaluator.find_expressions(root))  # populated the cache
+    names['x'] = 10
+    evaluator.invalidate_names(['x'])
+
+    values = {node: value for node, value in evaluator.find_expressions(root)}
+    assert values[root] == 12
+    assert values[root.left] == 10
+    assert values[root.right] == 2
+
+
+def test_invalidate_names_duplicates_and_iterables():
+    names = {'x': 1, 'y': 2}
+    evaluator = Evaluator(names)
+    node = parsed('x')
+    assert evaluator[node] == 1
+
+    # Duplicate names are harmless and only invalidate once.
+    evaluator.invalidate_names(['x', 'x', 'x'])
+    assert node not in evaluator._cache
+    assert evaluator[node] == 1
+
+    # Any finite iterable (not just lists) works, including empty ones.
+    evaluator.invalidate_names(('x',))
+    evaluator.invalidate_names({'x'})
+    evaluator.invalidate_names(iter(['x']))
+    evaluator.invalidate_names(iter([]))
+    evaluator.invalidate_names(_ for _ in ())
+    assert evaluator[node] == 1
+
+
+def test_invalidate_names_rejects_str_and_bytes():
+    evaluator = Evaluator({})
+    with pytest.raises(TypeError):
+        evaluator.invalidate_names('x')
+    with pytest.raises(TypeError):
+        evaluator.invalidate_names(b'x')
+
+
+def test_invalidate_names_rejects_non_str_elements():
+    evaluator = Evaluator({})
+    for bad_names in [
+        [1],
+        [b'x'],
+        [None],
+        ['x', 1],
+        ['x', None],
+    ]:
+        with pytest.raises(TypeError):
+            evaluator.invalidate_names(bad_names)
+
+
+def test_invalidate_names_non_iterable_propagates_typeerror():
+    evaluator = Evaluator({})
+    for bad in [None, 42, 3.14, True]:
+        with pytest.raises(TypeError):
+            evaluator.invalidate_names(bad)
+
+
+def test_invalidate_names_iteration_error_propagates_unchanged():
+    class Boom(Exception):
+        pass
+
+    def exploding():
+        yield 'x'
+        raise Boom()
+
+    names = {'x': 1}
+    evaluator = Evaluator(names)
+    node = parsed('x')
+    assert evaluator[node] == 1
+
+    with pytest.raises(Boom):
+        evaluator.invalidate_names(exploding())
+
+    # The error during iteration must not have changed the cache.
+    assert node in evaluator._cache
+    assert evaluator[node] == 1
+
+
+def test_invalidate_names_validation_failure_is_atomic():
+    names = {'x': 1, 'y': 2}
+    evaluator = Evaluator(names)
+    node_x = parsed('x')
+    node_y = parsed('y')
+    assert evaluator[node_x] == 1
+    assert evaluator[node_y] == 2
+
+    # The valid 'x' comes before the invalid element, but validation failure
+    # must not invalidate anything.
+    with pytest.raises(TypeError):
+        evaluator.invalidate_names(['x', 3])
+
+    assert node_x in evaluator._cache
+    assert node_y in evaluator._cache
+    assert evaluator[node_x] == 1
+    assert evaluator[node_y] == 2
